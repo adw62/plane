@@ -450,7 +450,7 @@ function updateWeapons(dt) {
 // at zero it crashes. (A hard terrain/building collision still wrecks instantly.)
 // Health packs floating low over the city restore a point.
 // ---------------------------------------------------------------------------
-const MAX_HEALTH = 2;
+const MAX_HEALTH = 3;
 let health = MAX_HEALTH;
 const hpEl = document.getElementById('hp');   // lives in the instrument panel
 function updateHealthHUD() { hpEl.innerHTML = `<span style="color:#ff4d4d">${'✚'.repeat(health)}</span><span style="opacity:.3">${'✚'.repeat(Math.max(0, MAX_HEALTH - health))}</span>`; }

@@ -10,6 +10,11 @@ import { Sky } from 'three/addons/objects/Sky.js';
 // ===========================================================================
 
 const DAY_LENGTH = 300;        // seconds for a full day↔night cycle
+// Sun-height shaping: the raw sin() is lifted + shrunk so the trough sits near
+// the horizon — a short, shallow night, and the sun's slow-moving low region
+// lingers around the horizon for long golden sunrises/sunsets.
+const SUN_AMP  = 0.72;        // < 1 → shallower swing
+const SUN_LIFT = 0.36;        // > 0 → raises the curve (shorter night)
 const CLOUD_COUNT = 20;        // number of cloud blobs (each ~200 splats)
 const CLOUD_SPREAD = 1300;     // half-extent clouds are scattered over (around the city)
 const CLOUD_LO = 95, CLOUD_HI = 220;   // low enough to fly through near the towers
@@ -213,10 +218,11 @@ export function buildSky(scene, camera) {
   function update(dt) {
     if (cycle) t += dt;
     const day = (t / DAY_LENGTH) * Math.PI * 2;
-    const elevation = Math.sin(day);                       // -1 .. 1
+    // lifted + shrunk sine → short shallow night, long lingering dawn/dusk
+    const elevation = THREE.MathUtils.clamp(Math.sin(day) * SUN_AMP + SUN_LIFT, -1, 1);
     const dayAmount = THREE.MathUtils.smoothstep(elevation, -0.12, 0.28);
     const night = 1 - THREE.MathUtils.smoothstep(elevation, -0.06, 0.14);
-    const sunset = Math.exp(-(elevation * elevation) / (0.30 * 0.30));   // horizon glow (wide = long sunset)
+    const sunset = Math.exp(-(elevation * elevation) / (0.34 * 0.34));   // horizon glow (wider = longer sunset)
 
     // one sun direction drives the Sky and the light
     const elevAngle = elevation * Math.PI / 2;
