@@ -42,7 +42,7 @@ const TURRET_TRACK = 2.4;   // turret yaw slew toward the plane (rad/s)
 const TANK_HIT_R   = 6;     // shootable radius around a tank (world units)
 const TANK_CENTRE_Y = 2;    // height of the tank's centre above its ground point (for aim/hit tests)
 const FIRE_RANGE   = 700;   // tanks only shoot at the plane within this distance
-const FIRE_INTERVAL = 4.5;  // average seconds between a tank's shots (randomised per shot)
+const FIRE_INTERVAL = 6.5;  // average seconds between a tank's shots (randomised per shot)
 const SHELL_SPEED  = 120;   // tank shell speed (world units/s) — also sets the lead time
 const SHELL_LIFE   = 8;     // seconds before a shell expires
 const LOS_MEMORY   = 10;    // a tank only fires if it has had line of sight within this many seconds
@@ -50,6 +50,8 @@ const LOS_INTERVAL = 0.25;  // how often a tank re-checks line of sight to the p
 const AIM_NOISE    = 0.05;  // aim scatter as a fraction of range (0 = perfect aim; bigger = wilder)
 const MUZZLE_Y     = 4.5;   // height the shell leaves the turret (above the tank's ground point)
 const PLANE_HIT_R  = 8;     // shell-vs-plane hit radius (world units)
+const WHOOSH_R     = 66;    // a shell within this of the plane drives a building, doppler'd fly-by whoosh
+const CRACK_R      = 20;    // only passes closer than this snap a "crack/whizz" accent at closest approach
 const MIN_TANKS    = 3;     // keep at least this many tanks on the field
 const MAX_TANKS    = 5;     // ...and at most this many
 const RESPAWN_FAST = 1.5;   // seconds between respawns while below MIN_TANKS
@@ -157,12 +159,13 @@ function placeOnBeach(heightAt, front, count) {
 // and returns a handle. They patrol drivable terrain between random waypoints,
 // conform to the ground slope, and keep their turrets aimed at `targetPos`.
 //   world: { heightAt, grid, raycastSolids }  (from buildWorld)
-export function buildTanks(scene, world, front, count = 5) {
+export function buildTanks(scene, world, front, count = 5, audio = null) {
   const heightAt = world.heightAt;
   const grid = world.grid;
   const tanks = [];   // declared early so refresh() (runs before the models load) can reach it
   let template = null;   // the loaded tank rig, cloned per spawn
   let respawnTimer = 0;
+  let lastTarget = null;   // most recent plane position (for the death-blast distance)
 
   // --- obstacle grid: cells whose column hits a building/tree are removed from the
   //     tanks' nav (no dilation — only the actually-covered cells). The collision
@@ -331,12 +334,71 @@ export function buildTanks(scene, world, front, count = 5) {
   // --- explosions: a quick expanding, fading puff when a tank is destroyed -----
   const fx = [];
   const fxGeo = new THREE.SphereGeometry(1, 12, 10);
-  function spawnExplosion(pos) {
+  function spawnExplosion(pos, scale = 1) {
     const mat = new THREE.MeshBasicMaterial({ color: 0xffa22a, transparent: true, opacity: 1, depthWrite: false });
     const mesh = new THREE.Mesh(fxGeo, mat);
     mesh.position.copy(pos);
     scene.add(mesh);
-    fx.push({ mesh, age: 0, ttl: 0.5 });
+    fx.push({ mesh, age: 0, ttl: 0.5, scale });
+  }
+
+  // --- burning wrecks: when a tank dies it doesn't vanish. The turret is blown
+  //     off as a tumbling physics object (gravity + spin, bounces, settles) and
+  //     the hull stays put, on fire, until ~WRECK_LIFE has passed AND it's off
+  //     screen (so it never pops out from under the player's gaze). ------------
+  const wrecks = [];
+  const WRECK_LIFE = 20;        // min seconds a wreck burns before it may be removed
+  const WRECK_MAX  = 45;        // hard cap: gone by now even if stared at
+  const FX_GRAVITY = -34;       // gravity for the flying turret (world u/s^2)
+  const _frustum = new THREE.Frustum();
+  const _frMat   = new THREE.Matrix4();
+  const _wp = new THREE.Vector3(), _wq = new THREE.Quaternion(), _ws = new THREE.Vector3();
+
+  // Rising flame / smoke puffs (continuously emitted by burning wrecks).
+  const fire = [];
+  const fireGeo = new THREE.SphereGeometry(1, 6, 5);
+  function spawnFire(x, y, z) {
+    const flame = Math.random() < 0.65;
+    const mat = new THREE.MeshBasicMaterial({
+      color: flame ? (Math.random() < 0.5 ? 0xff5a1a : 0xffb12a) : 0x2a2a2a,
+      transparent: true, opacity: flame ? 0.9 : 0.45, depthWrite: false,
+      blending: flame ? THREE.AdditiveBlending : THREE.NormalBlending,
+    });
+    const m = new THREE.Mesh(fireGeo, mat);
+    m.position.set(x + (Math.random() * 2 - 1) * 2, y + Math.random() * 1.5, z + (Math.random() * 2 - 1) * 2);
+    m.scale.setScalar(flame ? 1.0 + Math.random() * 1.4 : 1.6 + Math.random() * 1.8);
+    scene.add(m);
+    fire.push({ mesh: m, age: 0, ttl: flame ? 0.5 + Math.random() * 0.4 : 1.2 + Math.random() * 0.9,
+                vy: flame ? 7 + Math.random() * 4 : 9 + Math.random() * 5, grow: flame ? 1.6 : 2.6 });
+  }
+
+  // Turn tank `t` into a burning wreck: blast, detach the turret as a physics
+  // object, keep the hull as the smouldering chassis.
+  function wreckTank(t) {
+    const p = t.group.position;
+    spawnExplosion(new THREE.Vector3(p.x, p.y + TANK_CENTRE_Y, p.z), 1.5);
+
+    // Detach the turret pivot into world space (scene is identity), then launch it.
+    const pivot = t.turret;
+    pivot.updateWorldMatrix(true, false);
+    pivot.matrixWorld.decompose(_wp, _wq, _ws);
+    scene.add(pivot);                                  // reparent to scene
+    pivot.position.copy(_wp); pivot.quaternion.copy(_wq); pivot.scale.copy(_ws);
+
+    // Flickering firelight that washes the surroundings — reads mostly at night.
+    // decay 1 (gentle falloff) so it pools over the ground without blowing out.
+    const light = new THREE.PointLight(0xff6a22, 0, 140, 1);
+    light.position.set(p.x, p.y + 3, p.z);
+    scene.add(light);
+
+    wrecks.push({
+      hull: t.group, turret: pivot, light, flicker: Math.random() * 6.28, age: 0, emit: 0, landed: false,
+      tVel: new THREE.Vector3((Math.random() * 2 - 1) * 7, 28 + Math.random() * 14, (Math.random() * 2 - 1) * 7),
+      tSpin: new THREE.Vector3((Math.random() * 2 - 1) * 7, (Math.random() * 2 - 1) * 7, (Math.random() * 2 - 1) * 7),
+    });
+
+    // Sound last + guarded: a stale/old audio module must never block the kill.
+    audio?.explosion?.(lastTarget ? p.distanceTo(lastTarget) : 0);   // boom, by range to the plane
   }
 
   // --- tank shells: straight-line tracers the tanks fire at the plane -----------
@@ -384,27 +446,50 @@ export function buildTanks(scene, world, front, count = 5) {
     mesh.position.copy(_muzzle);
     scene.add(mesh);
     shells.push({ mesh, vel: _dir.clone().multiplyScalar(SHELL_SPEED), life: SHELL_LIFE });
+    if (audio) audio.tankGun(dist);                                    // boom, attenuated by range
   }
 
   return {
     tanks,
     refreshObstacles: refresh,   // re-scan obstacles + replan tanks (call once the city exists)
+    // Threat bearings for the cockpit ring: normalised horizontal directions
+    // (dx,dz) from the plane toward each nearby tank, plus each inbound shell
+    // (flagged `incoming`). Directions point at where the danger is.
+    getThreats(planePos, radius = 600) {
+      const out = [];
+      const r2 = radius * radius;
+      for (const t of tanks) {
+        const p = t.group.position;
+        const dx = p.x - planePos.x, dz = p.z - planePos.z;
+        if (dx * dx + dz * dz > r2) continue;
+        const inv = 1 / Math.max(1e-3, Math.hypot(dx, dz));
+        out.push({ dx: dx * inv, dz: dz * inv, incoming: false });
+      }
+      for (const s of shells) {
+        const sp = s.mesh.position;
+        const dx = planePos.x - sp.x, dy = planePos.y - sp.y, dz = planePos.z - sp.z;
+        if (s.vel.x * dx + s.vel.y * dy + s.vel.z * dz <= 0) continue;   // shell moving away → no threat
+        const inv = 1 / Math.max(1e-3, Math.hypot(dx, dz));
+        out.push({ dx: -dx * inv, dz: -dz * inv, incoming: true });      // point toward the oncoming shell
+      }
+      return out;
+    },
     // Destroy the nearest tank within `radius` of `point`; returns true on a hit.
     tryHit(point, radius = TANK_HIT_R) {
       for (let i = 0; i < tanks.length; i++) {
         const p = tanks[i].group.position;
         const dx = p.x - point.x, dy = p.y + TANK_CENTRE_Y - point.y, dz = p.z - point.z;
         if (dx * dx + dy * dy + dz * dz <= radius * radius) {
-          spawnExplosion(new THREE.Vector3(p.x, p.y + TANK_CENTRE_Y, p.z));
-          scene.remove(tanks[i].group);
+          wreckTank(tanks[i]);     // blast + flying turret + burning hull (kept in scene)
           tanks.splice(i, 1);
           return true;
         }
       }
       return false;
     },
-    update(dt, targetPos, targetVel) {
+    update(dt, targetPos, targetVel, camera = null, night = 0) {
       clock += dt;
+      if (targetPos) lastTarget = targetPos;   // remember plane pos for death-blast distance
 
       // --- keep MIN..MAX tanks on the field, respawning away from the plane
       //     (quickly while below the minimum, slowly while topping up to the max) ---
@@ -501,16 +586,45 @@ export function buildTanks(scene, world, front, count = 5) {
       // --- advance shells: straight-line travel; a shell that passes within
       //     PLANE_HIT_R of the plane hits it (returned so main.js can crash). ---
       let playerHit = false;
+      let nearMiss = 0;   // strongest close-pass intensity this frame (0..1), for camera shake
       for (let i = shells.length - 1; i >= 0; i--) {
         const s = shells[i];
         s.mesh.position.addScaledVector(s.vel, dt);
         s.life -= dt;
         let dead = s.life <= 0;
-        if (!dead && targetPos && s.mesh.position.distanceTo(targetPos) < PLANE_HIT_R) {
+        const toPlane = targetPos ? s.mesh.position.distanceTo(targetPos) : Infinity;
+        // sustained fly-by: a whoosh that builds as the shell nears and dopplers
+        // with the closing speed. Spin up a voice on entry, update it each frame,
+        // tear it down when the shell leaves the radius (or dies, below).
+        if (audio && targetPos && toPlane < WHOOSH_R) {
+          if (!s.whoosh) s.whoosh = audio.whoosh();
+          if (s.whoosh) {
+            // closing speed = rate the gap shrinks = relative velocity projected
+            // onto the shell→plane line (positive when approaching → pitch up)
+            const ux = (targetPos.x - s.mesh.position.x) / toPlane;
+            const uy = (targetPos.y - s.mesh.position.y) / toPlane;
+            const uz = (targetPos.z - s.mesh.position.z) / toPlane;
+            const vx = s.vel.x - (targetVel ? targetVel.x : 0);
+            const vy = s.vel.y - (targetVel ? targetVel.y : 0);
+            const vz = s.vel.z - (targetVel ? targetVel.z : 0);
+            const closing = vx * ux + vy * uy + vz * uz;
+            s.whoosh.set(toPlane, closing, WHOOSH_R);
+            // closest approach = closing flips approaching→receding → snap a crack,
+            // gated to genuinely close passes (intensity 0 beyond CRACK_R) and to a
+            // every close pass cracks/whizzes (volume scales with how close it is)
+            if (s.prevClosing > 0 && closing <= 0) {
+              const intensity = 1 - toPlane / CRACK_R;
+              audio.crack(intensity);
+              if (intensity > nearMiss) nearMiss = intensity;   // closest pass drives the shake
+            }
+            s.prevClosing = closing;
+          }
+        } else if (s.whoosh) { s.whoosh.stop(); s.whoosh = null; }
+        if (!dead && toPlane < PLANE_HIT_R) {
           spawnExplosion(s.mesh.position); playerHit = true; dead = true;
         }
         if (!dead && s.mesh.position.y < heightAt(s.mesh.position.x, s.mesh.position.z)) dead = true;
-        if (dead) { scene.remove(s.mesh); shells.splice(i, 1); }
+        if (dead) { if (s.whoosh) s.whoosh.stop(); scene.remove(s.mesh); shells.splice(i, 1); }
       }
 
       // --- advance explosions ---
@@ -518,12 +632,73 @@ export function buildTanks(scene, world, front, count = 5) {
         const e = fx[i];
         e.age += dt;
         const k = e.age / e.ttl;
-        e.mesh.scale.setScalar(2 + k * 14);
+        e.mesh.scale.setScalar((2 + k * 14) * e.scale);
         e.mesh.material.opacity = 1 - k;
         if (k >= 1) { scene.remove(e.mesh); e.mesh.material.dispose(); fx.splice(i, 1); }
       }
 
-      return playerHit;
+      // --- burning wrecks: tumble the flying turret, emit fire, retire off-screen ---
+      if (wrecks.length && camera) {
+        _frMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+        _frustum.setFromProjectionMatrix(_frMat);
+      }
+      for (let i = wrecks.length - 1; i >= 0; i--) {
+        const w = wrecks[i];
+        w.age += dt;
+
+        // turret physics: gravity, spin, bounce + settle on the terrain
+        const tp = w.turret.position;
+        if (!w.landed) {
+          w.tVel.y += FX_GRAVITY * dt;
+          tp.addScaledVector(w.tVel, dt);
+          w.turret.rotation.x += w.tSpin.x * dt;
+          w.turret.rotation.y += w.tSpin.y * dt;
+          w.turret.rotation.z += w.tSpin.z * dt;
+          const restY = heightAt(tp.x, tp.z) + 1.2;
+          if (tp.y <= restY) {
+            tp.y = restY;
+            w.tVel.y *= -0.35; w.tVel.x *= 0.6; w.tVel.z *= 0.6;   // damped bounce
+            w.tSpin.multiplyScalar(0.5);
+            if (Math.abs(w.tVel.y) < 2.5) { w.tVel.set(0, 0, 0); w.tSpin.set(0, 0, 0); w.landed = true; }
+          }
+        }
+
+        // emit flame/smoke from the hull (thins out as it burns down)
+        w.emit -= dt;
+        if (w.emit <= 0) {
+          w.emit = 0.04;
+          const hp = w.hull.position;
+          spawnFire(hp.x, hp.y + TANK_CENTRE_Y, hp.z);
+          if (w.age > WRECK_LIFE * 0.4 && Math.random() < 0.5) spawnFire(tp.x, tp.y, tp.z);  // turret smokes too
+        }
+
+        // flickering firelight: brightest at night, fading over the last seconds
+        w.flicker += dt * 11;
+        const fade = 1 - THREE.MathUtils.clamp((w.age - (WRECK_MAX - 4)) / 4, 0, 1);   // ease off near the end
+        const flick = 0.62 + 0.22 * Math.sin(w.flicker) + 0.16 * Math.random();
+        w.light.intensity = (9 + night * 42) * flick * fade;   // mostly reads after dark
+
+        // retire: past its burn time and out of view, or past the hard cap
+        const onScreen = camera ? _frustum.containsPoint(w.hull.position) : true;
+        if ((w.age > WRECK_LIFE && !onScreen) || w.age > WRECK_MAX) {
+          scene.remove(w.hull); scene.remove(w.turret); scene.remove(w.light);
+          wrecks.splice(i, 1);
+        }
+      }
+
+      // --- advance flame / smoke puffs ---
+      for (let i = fire.length - 1; i >= 0; i--) {
+        const f = fire[i];
+        f.age += dt;
+        const k = f.age / f.ttl;
+        f.mesh.position.y += f.vy * dt;
+        f.vy *= (1 - dt * 0.8);                       // slow as it rises
+        f.mesh.scale.addScalar(f.grow * dt);
+        f.mesh.material.opacity *= (1 - dt * 1.6);
+        if (k >= 1) { scene.remove(f.mesh); f.mesh.material.dispose(); fire.splice(i, 1); }
+      }
+
+      return { hit: playerHit, nearMiss };
     },
   };
 }

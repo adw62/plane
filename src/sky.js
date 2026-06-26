@@ -208,7 +208,7 @@ export function buildSky(scene, camera) {
   const horiz = new THREE.Color();
   const warm = new THREE.Color();
   let t = DAY_LENGTH * 0.25;            // midday
-  let cycle = false;                    // start frozen on day; toggle at runtime
+  let cycle = true;                     // day/night cycle runs by default; T toggles it
 
   function update(dt) {
     if (cycle) t += dt;

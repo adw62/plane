@@ -30,10 +30,63 @@
                      border-radius: 4px; overflow: hidden; vertical-align: middle; }
     #hud .throttle > i { display: block; height: 100%; background: #6fd36f; width: 0; }
     #stall { color: #ff5a4d; font-weight: bold; margin-top: 4px; opacity: 0; transition: opacity .15s; }
-    #mode { position: fixed; top: 12px; right: 12px; font-family: ui-monospace, Menlo, Consolas, monospace;
+    #mode { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); text-align: center; font-family: ui-monospace, Menlo, Consolas, monospace;
             font-size: 12px; color: #ffd86f; text-shadow: 0 1px 3px rgba(0,0,0,.6); z-index: 5; user-select: none; }
-    #help { left: 12px; bottom: 12px; font-size: 12px; opacity: .82; line-height: 1.5; }
     #help b { color: #ffd86f; }
+
+    /* ---- analog dials: a big main dial + a satellite bubble ---- */
+    #panel { position: fixed; left: 20px; bottom: 18px;
+             z-index: 4; user-select: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    #dialMain { position: relative; width: 162px; height: 162px; }
+    #dialMainSvg { position: relative; z-index: 2; }              /* main face above the satellite */
+    #dialSat  { position: absolute; width: 88px; height: 88px; top: -10px; right: -54px; z-index: 1; }  /* bubble, behind main */
+    .dial { width: 100%; height: 100%; display: block; filter: drop-shadow(0 3px 9px rgba(0,0,0,.6)); }
+    .dial .face   { fill: #0c1117; }
+    .dial .bezel  { fill: none; stroke: rgba(220,230,242,.35); stroke-width: 2.4; }
+    .dial .arc    { fill: none; stroke: rgba(255,255,255,.30); stroke-width: 2; stroke-linecap: round; }
+    .dial .red    { fill: none; stroke: #ff5a4d; stroke-width: 2.6; stroke-linecap: round; opacity: .9; }
+    .dial .tick     { stroke: rgba(255,255,255,.5);  stroke-width: 1; }
+    .dial .tick.big { stroke: rgba(255,255,255,.85); stroke-width: 1.7; }
+    /* recessed window channel; the pointer is a triangle that rides it, its body
+       clipped (hidden) behind the face so only the arrow tip shows */
+    .dial .slot { fill: none; stroke: #04070a; stroke-width: 8; stroke-linecap: round; }
+    .dial .ptr  { fill: #ffd86f; }
+    .dial .stem { fill: #ffd86f; }
+
+    /* main-dial face contents: health (crosses) over throttle */
+    #dialMainCenter { position: absolute; inset: 0; z-index: 3; display: flex; flex-direction: column;
+                      align-items: center; justify-content: center; gap: 6px; pointer-events: none; }
+    #hp { font-size: 21px; letter-spacing: 4px; color: #ff4d4d; transition: transform .12s;
+          text-shadow: 0 1px 4px rgba(0,0,0,.6); }
+    #thrWrap { display: flex; flex-direction: column; align-items: center; gap: 3px;
+               color: #cfe9cf; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+    #thrWrap .tbar { width: 56px; height: 6px; background: rgba(255,255,255,.2); border-radius: 4px; overflow: hidden; }
+    #thrWrap .tbar > i { display: block; height: 100%; width: 0; background: #6fd36f; transition: width .08s linear; }
+    #thrWrap .tlabel { font-size: 10px; letter-spacing: .12em; opacity: .9; }
+    #overheat { font-size: 9px; font-weight: bold; letter-spacing: .14em; color: #ff4030; opacity: 0;
+                text-shadow: 0 0 6px rgba(255,64,48,.8); }
+
+    /* satellite-dial face contents: altitude */
+    #dialSatCenter { position: absolute; inset: 0; display: flex; flex-direction: column;
+                     align-items: center; justify-content: center; pointer-events: none;
+                     color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+    #dialSatCenter .v { font: 700 14px ui-monospace, monospace; }
+    #dialSatCenter small { font-size: 8px; letter-spacing: .14em; opacity: .6; }
+
+    #stall { position: absolute; left: 0; right: 0; bottom: -16px; text-align: center;
+             color: #ff5a4d; font-weight: bold; font-size: 12px; opacity: 0; transition: opacity .15s;
+             text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+
+    /* ---- collapsible controls ---- */
+    #help { top: 12px; right: 12px; display: flex; flex-direction: column; align-items: flex-end; }
+    #helpToggle { background: rgba(20,26,32,.72); color: #ffd86f; border: 1px solid rgba(255,255,255,.18);
+                  padding: 5px 11px; border-radius: 6px; cursor: pointer; font: 600 12px ui-monospace, monospace; }
+    #helpToggle:hover { background: rgba(30,38,46,.82); }
+    #helpBody { margin-top: 8px; max-width: 340px; font-size: 12px; line-height: 1.8; color: #fff;
+                background: rgba(20,26,32,.66); border: 1px solid rgba(255,255,255,.12);
+                border-radius: 8px; padding: 10px 12px; }
+    #helpBody.collapsed { display: none; }
+    #helpBody b { color: #ffd86f; }
   </style>
 
   <!-- Import map: pin three.js + addons from a CDN so it works on GitHub Pages with no build step -->
@@ -54,16 +107,33 @@
     <div>Loading plane…</div>
     <div class="bar"><i id="bar"></i></div>
   </div>
-  <div id="hud">
-    <div>SPD <span id="spd">0</span></div>
-    <div>ALT <span id="alt">0</span></div>
-    <div>V/S <span id="vs">0</span></div>
-    <div>THR <span class="throttle"><i id="thrbar"></i></span> <span id="thr">0</span>%</div>
+  <div id="hud"></div>
+  <div id="mode"></div>
+
+  <div id="panel">
+    <div id="dialMain">
+      <div id="dialMainSvg"></div>
+      <div id="dialMainCenter">
+        <div id="hp"></div>
+        <div id="thrWrap">
+          <span class="tbar"><i id="thrbar"></i></span>
+          <span class="tlabel">THR <span id="thr">0</span>%</span>
+          <span id="overheat">OVERHEAT</span>
+        </div>
+      </div>
+      <div id="dialSat">
+        <div id="dialSatSvg"></div>
+        <div id="dialSatCenter"><span class="v" id="alt">0</span><small>ALT</small></div>
+      </div>
+    </div>
     <div id="stall">⚠ STALL</div>
   </div>
-  <div id="mode"></div>
+
   <div id="help">
-    <b>W/S</b> pitch &nbsp; <b>A/D</b> roll &nbsp; <b>Q/E</b> yaw &nbsp; <b>Space/Shift</b> throttle &nbsp; <b>F</b> fire &nbsp; <b>R</b> reset &nbsp; <b>T</b> day/night &nbsp; <b>[ ]</b> time &nbsp; <b>U</b> free-cam
+    <button id="helpToggle">⌨ Controls</button>
+    <div id="helpBody" class="collapsed">
+      <b>W/S</b> pitch &nbsp; <b>A/D</b> roll &nbsp; <b>Q/E</b> yaw &nbsp; <b>Space/Shift</b> throttle &nbsp; <b>F</b> fire &nbsp; <b>R</b> reset &nbsp; <b>T</b> day/night &nbsp; <b>[ ]</b> time &nbsp; <b>U</b> free-cam &nbsp; <b>mouse-drag</b> orbit
+    </div>
   </div>
 
   <script type="module" src="./src/main.js"></script>

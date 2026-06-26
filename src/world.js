@@ -127,6 +127,38 @@ function heightAt(x, z) {
 }
 
 // ---------------------------------------------------------------------------
+// Terrain colour: the same height-banded palette the mesh is vertex-coloured
+// with, exposed as a point query so impact fx (bullet ground hits) can match
+// the ground they struck. Kept as one function so mesh + query never drift.
+// ---------------------------------------------------------------------------
+const _tcSand   = new THREE.Color(0xcdc08a);
+const _tcGrass  = new THREE.Color(0x5b8a4a);
+const _tcGrassHi= new THREE.Color(0x6f9a52);
+const _tcRock   = new THREE.Color(0x7d756b);
+const _tcSnow   = new THREE.Color(0xeef2f5);
+
+function terrainColorAt(x, z, out = new THREE.Color()) {
+  const h = heightAt(x, z);
+  // colour bands: green plain/foothills, rocky volcano flanks, snow-capped summit.
+  // Bands blend with smoothstep (not hard cuts) so boundaries are soft gradients.
+  const grassTop = 52;
+  const rockTop = VOLCANO_H * 0.5;
+  // 1) land colour: grass → rock → snow by height
+  out.copy(_tcGrass).lerp(_tcGrassHi, (fbm(x + 99, z - 99) * 0.5 + 0.5));
+  if (h >= grassTop) {
+    const toRock = THREE.MathUtils.smoothstep(h, grassTop, rockTop);
+    out.lerp(_tcRock, toRock);
+    out.lerp(_tcSnow, THREE.MathUtils.smoothstep(h, rockTop, rockTop + VOLCANO_H * 0.25));
+  }
+  // 2) sand along the shoreline, blended over a band; jitter the height with
+  //    noise so the sand line wiggles organically rather than sitting on a contour.
+  const beachH = h + fbm(x - 53, z + 53) * 2.5;
+  const sandT = 1 - THREE.MathUtils.smoothstep(beachH, 7, 13);   // 1 at the shore → 0 inland
+  out.lerp(_tcSand, sandT);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Build terrain mesh (vertex-coloured by height) + a sea plane.
 // ---------------------------------------------------------------------------
 function buildTerrain(scene) {
@@ -134,36 +166,12 @@ function buildTerrain(scene) {
   geo.rotateX(-Math.PI / 2);                       // into the XZ plane
   const pos = geo.attributes.position;
   const colors = new Float32Array(pos.count * 3);
-
-  const sand = new THREE.Color(0xcdc08a);
-  const grass = new THREE.Color(0x5b8a4a);
-  const grassHi = new THREE.Color(0x6f9a52);
-  const rock = new THREE.Color(0x7d756b);
-  const snow = new THREE.Color(0xeef2f5);
   const c = new THREE.Color();
 
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i), z = pos.getZ(i);
-    const h = heightAt(x, z);
-    pos.setY(i, h);
-
-    // colour bands: green plain/foothills, rocky volcano flanks, snow-capped summit.
-    // Bands blend with smoothstep (not hard cuts) so boundaries are soft gradients
-    // instead of zigzag lines that follow the triangle edges.
-    const grassTop = 52;
-    const rockTop = VOLCANO_H * 0.5;
-    // 1) land colour: grass → rock → snow by height
-    c.copy(grass).lerp(grassHi, (fbm(x + 99, z - 99) * 0.5 + 0.5));
-    if (h >= grassTop) {
-      const toRock = THREE.MathUtils.smoothstep(h, grassTop, rockTop);
-      c.lerp(rock, toRock);
-      c.lerp(snow, THREE.MathUtils.smoothstep(h, rockTop, rockTop + VOLCANO_H * 0.25));
-    }
-    // 2) sand along the shoreline, blended over a band; jitter the height with
-    //    noise so the sand line wiggles organically rather than sitting on a contour.
-    const beachH = h + fbm(x - 53, z + 53) * 2.5;
-    const sandT = 1 - THREE.MathUtils.smoothstep(beachH, 7, 13);   // 1 at the shore → 0 inland
-    c.lerp(sand, sandT);
+    pos.setY(i, heightAt(x, z));
+    terrainColorAt(x, z, c);
     colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
   }
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -603,7 +611,7 @@ export function buildWorld(scene, onCityReady) {
   // collision meshes (BVH): trees now, the city's big blocks once the worker returns
   const collisionMeshes = [];
   const treeCollision = makeCollisionMesh(treeCollisionGeo);
-  if (treeCollision) collisionMeshes.push(treeCollision);
+  if (treeCollision) { treeCollision.userData.isTree = true; collisionMeshes.push(treeCollision); }
 
   const shaderRefs = [];
   if (magmaMat) shaderRefs.push(magmaMat);          // animate the lava via uTime
@@ -636,6 +644,8 @@ export function buildWorld(scene, onCityReady) {
     grid,   // terrain analysis (height/slope/type per cell) — drives tank traversability
     // ground height the plane should not pass through (land, or sea level)
     groundAt(x, z) { return Math.max(heightAt(x, z), 0); },
+    // height-banded terrain colour at a point (matches the mesh) — for impact fx
+    terrainColorAt,
     // nearest solid surface (building or tree) along a ray; { distance, point, normal } or null
     raycastSolids(origin, dir, far) {
       if (!collisionMeshes.length) return null;
@@ -643,7 +653,8 @@ export function buildWorld(scene, onCityReady) {
       const hits = ray.intersectObjects(collisionMeshes, false);
       if (!hits.length) return null;
       const h = hits[0];
-      return { distance: h.distance, point: h.point, normal: h.face ? h.face.normal : null };
+      return { distance: h.distance, point: h.point, normal: h.face ? h.face.normal : null,
+               tree: h.object.userData.isTree === true };
     },
     update(elapsed, night = 0) {
       for (const m of shaderRefs) {
